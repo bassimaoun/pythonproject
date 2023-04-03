@@ -1,0 +1,411 @@
+import pandas as pd
+import numpy as np
+from sqlalchemy import create_engine
+from bokeh.io import show
+from bokeh.models import ColumnDataSource, HoverTool
+from bokeh.plotting import figure, output_notebook
+import os
+import unittest
+import random
+import csv
+import sqlite3
+
+class Dataset:
+    """
+    A class that represents a dataset, which is initialized by reading a CSV file.  
+        Attributes:
+    -----------
+    filename : str 
+    The path of the CSV file to read as dataset.
+
+    df : pandas.DataFrame
+        A DataFrame containing the dataset read from the CSV file.
+
+    Methods:
+    --------
+    get_x():Returns the values of the 'x' column of the dataset.
+    get_y(col):Returns the values of the specified column of the dataset.
+    get_all_y():Returns all the values of the columns of the dataset.
+    """
+    def __init__(self, filename):
+        try:
+            self.df = pd.read_csv(filename)
+        except FileNotFoundError:
+            print(f"Error: File {filename} not found.")
+            raise
+    
+    def get_x(self):
+        #returns all 'x' values
+        return self.df['x'].values
+    
+    def get_y(self, col):
+        #returns all 'y' values
+        return self.df[col].values
+    
+    def get_all_y(self):
+        #returns all y values if there are more than one 'y'
+        return self.df.iloc[:, 0:].values
+
+class TrainDataset(Dataset):
+    """ loads train dataset """
+    def __init__(self, file_path):
+        try:
+            super().__init__(file_path)
+            self.x = self.df['x']
+            self.y = self.df.iloc[:, 1:].values
+            
+        except KeyError:
+            print("Error: Column 'x' or other columns not found.")
+            raise
+
+class TestDataset(Dataset):
+    """ loads test dataset """
+    def __init__(self, file_path):
+        try:
+            super().__init__(file_path)
+            self.x = self.df['x']
+            self.y = self.df.iloc[:, 1:].values
+        except KeyError:
+            print("Error: Column 'x' or other columns not found.")
+            raise
+        
+class IdealDataset(Dataset):
+    """ loads ideal dataset """
+    def __init__(self, file_path):
+        try:
+            super().__init__(file_path)
+        except FileNotFoundError:
+            print(f"Error: File {file_path} not found.")
+            raise
+
+        
+class IdealFunctionMapper(Dataset):
+    """
+    A class for mapping test data to the closest ideal function using the least squares method.
+    Attributes:
+    train_data (TrainDataset): An instance of TrainDataset containing the training data.
+    ideal_data (IdealDataset): An instance of IdealDataset containing the ideal functions.
+    test_data (TestDataset): An instance of TestDataset containing the test data.
+    y_cols (list): A list of column names for the ideal functions.
+
+    Methods:
+    get_best_fit_functions(train_data): Calculates the best fit functions for 
+    each ideal function using the training data.
+    
+    map_to_ideal_functions(best_fit_functions): Maps the test data to the closest 
+    ideal function based on the least squares method and returns the mapping results.
+    
+    map(): Calls get_best_fit_functions and map_to_ideal_functions methods and 
+    returns the mapping results.
+    """
+    def __init__(self, train_file, ideal_file, test_file):
+        try:
+            self.train_data = TrainDataset(train_file)
+            self.ideal_data = IdealDataset(ideal_file)
+            self.test_data = TestDataset(test_file)
+            self.y_cols = list(set(self.ideal_data.df.columns[1:]))
+        except FileNotFoundError:
+            print("File not found!")
+            raise
+        
+    def get_best_fit_functions(self,train_data):
+        """
+        Calculates the best fit functions for each ideal function using the training data and returns the results.
+
+        Args:
+        train_data (TrainDataset): An instance of TrainDataset containing the training data.
+
+        Returns:
+        dict: A dictionary containing the best fit functions for each ideal function, 
+        where the key is the column name of the ideal function and the value is another 
+        dictionary containing the coefficients and mean squared error of the best fit function.
+
+        Raises:
+        ValueError: If a ValueError occurred while calculating the best fit functions.
+        """
+        try:
+            # Get the deviations of the ideal data from the train data
+            y_devs = (self.ideal_data.df.iloc[:, 1:].values[:, :, np.newaxis] - train_data.get_all_y()[:, np.newaxis, :])
+            # Square the deviations
+            y_devs_sq = y_devs ** 2
+            # Calculate the least squares error for each function
+            lsq = np.sum(y_devs_sq, axis=2)
+            # Get the indices of the 4 best ideal functions
+            ideal_funcs_idx = np.argsort(np.sum(lsq, axis=0))[:4]
+            # Get the names of the ideal functions
+            ideal_func_names = self.ideal_data.df.columns[1:][ideal_funcs_idx]
+            ideal_func_indices = [np.where(self.ideal_data.df.columns == name)[0][0] for name in ideal_func_names]
+            # Get the actual values of the ideal functions
+            ideal_funcs = self.ideal_data.df.iloc[:, ideal_func_indices].values
+            ideal_func_results = {}
+            # Calculate the best fit function for each ideal function
+            for i, func_name in enumerate(ideal_func_names):
+                y_col = func_name
+                # Fit a first degree polynomial to the train data
+                coefficients = np.polyfit(train_data.x, train_data.y[:, i], deg=1)
+                # Predict the y values for the train data using the coefficients
+                predicted_y_train = np.polyval(coefficients, train_data.x)
+                # Calculate the mean squared error between the predicted y values and the actual y values
+                mse = np.mean((predicted_y_train - train_data.y[:, i]) ** 2)
+                ideal_func_results[y_col] = {
+                    "coefficients": coefficients,
+                    "mse": mse,
+                }
+            return ideal_func_results
+        except ValueError:
+            print("ValueError occurred while calculating best fit functions!")
+            raise
+    
+    def map_to_ideal_functions(self, best_fit_functions):
+        """
+        Maps each point in the test dataset to the closest ideal function from a set of best fit functions.
+
+        Args:
+            best_fit_functions: A dictionary containing the best fit functions for each ideal function.
+
+        Returns:
+            A list of tuples containing the x-coordinate, y-coordinate, the chosen ideal function and the deviation between the predicted y-coordinate and the actual y-coordinate.
+        """
+        try:
+            mappings = []
+            # Loop through each row in the test data
+            for index, row in self.test_data.df.iterrows():
+                x, y = row[["x", "y"]]
+                min_deviation = float("inf")
+                chosen_function = None
+                # Loop through each ideal function
+                for y_col in self.ideal_data.df.columns[1:]:
+                    if y_col not in best_fit_functions:
+                        # If the function is not one of the best fit functions, skip it
+                        continue
+                    function = best_fit_functions[y_col]
+                    # Predict the y-value for the given x-value using the best fit function
+                    predicted_y = np.polyval(function["coefficients"], x)
+                    # Calculate the deviation between the predicted y-value and the actual y-value
+                    deviation = abs(predicted_y - y)
+                    if deviation < min_deviation:
+                        min_deviation = deviation
+                        chosen_function = y_col
+                    # Add the mapping of the x-value, y-value, and chosen function with the corresponding 
+                mappings.append((x, y, chosen_function, min_deviation))
+            return mappings
+        except Exception as e:
+            print(f"Error: {e}")
+
+    def map(self):
+        try:
+            best_fit_functions = self.get_best_fit_functions(self.train_data)
+            results = self.map_to_ideal_functions(best_fit_functions)
+            return results
+        except Exception as e:
+            print(f"Error: {e}")
+
+            
+class SQLTable:
+    def __init__(self, db_name):
+        try:
+            self.db_name = db_name
+            self.engine = create_engine(f"sqlite:///{db_name}.db")
+        except Exception as e:
+            print(f"Error: {e}")
+            raise
+        
+    def load_train_data(self, train_file):
+        try:
+            train_data = pd.read_csv(train_file)
+            train_data.to_sql("train", self.engine, if_exists="replace", index=False)
+        except Exception as e:
+            print(f"Error: {e}")
+            raise
+        
+    def load_ideal_data(self, ideal_file):
+        try:
+            ideal_data = pd.read_csv(ideal_file)
+            ideal_data.to_sql("ideal", self.engine, if_exists="replace", index=False)
+        except Exception as e:
+            print(f"Error: {e}")
+            raise
+        
+    def load_results(self, result_file):
+        try:
+            results = pd.read_csv(result_file)
+            results.to_sql("results", self.engine, if_exists="replace", index=False)
+        except Exception as e:
+            print(f"Error: {e}")
+            raise
+        
+    def visualize_tables(self):
+        try:
+            conn = sqlite3.connect('my_db.db')
+            cur = conn.cursor()
+
+            # Query to retrieve all rows from table1
+            query1 = "SELECT * FROM ideal"
+            # Query to retrieve all rows from table2
+            query2 = "SELECT * FROM train"
+            # Query to retrieve all rows from table3
+            query3 = "SELECT * FROM results"
+
+            # Load query results into pandas dataframes
+            df1 = pd.read_sql_query(query1, conn)
+            df2 = pd.read_sql_query(query2, conn)
+            df3 = pd.read_sql_query(query3, conn)
+            print(pd.DataFrame(df1))
+            print(pd.DataFrame(df2))
+            print(pd.DataFrame(df3))
+            
+        except sqlite3.Error as e:
+            print(f"An error occurred while visualizing tables: {e}")
+      
+      
+class Visualization:
+    """
+    A class for visualizing data and results.
+    Attributes:
+    train_data (DataFrame): The training data loaded from a CSV file.
+    ideal_data (DataFrame): The ideal data loaded from a CSV file.
+    result_data (DataFrame): The result data loaded from a CSV file.
+
+    Methods:
+    plot_train_data(): Plots the training data.
+    plot_ideal_data(): Plots the ideal data and the results.
+    plot_results(): Plots only the results.
+    """
+    
+    def __init__(self, train_file, ideal_file, result_file):
+        try:
+            self.train_data = pd.read_csv(train_file)
+        except FileNotFoundError:
+            print(f"Error: {train_file} not found.")
+            self.train_data = None
+        try:
+            self.ideal_data = pd.read_csv(ideal_file)
+        except FileNotFoundError:
+            print(f"Error: {ideal_file} not found.")
+            self.ideal_data = None
+        try:
+            self.result_data = pd.read_csv(result_file)
+        except FileNotFoundError:
+            print(f"Error: {result_file} not found.")
+            self.result_data = None
+    
+    def plot_train_data(self):
+        # Plot the training data using Bokeh.
+        # If the train_data attribute is None, print an error message and return.
+        if self.train_data is None:
+            print("Error: train_data not found.")
+            return
+        output_notebook()  # initialize Bokeh for Jupyter Notebook
+        source = ColumnDataSource(self.train_data)  # create a data source for the plot
+        # create a scatter plot of x versus y1, y2, y3, and y4 using different colors for each
+        plot = figure(title="Training Data", x_axis_label="x", y_axis_label="y")
+        plot.circle(x='x', y='y1', source=source, size=10, color='blue')
+        plot.circle(x='x', y='y2', source=source, size=10, color='green')
+        plot.circle(x='x', y='y3', source=source, size=10, color='orange')
+        plot.circle(x='x', y='y4', source=source, size=10, color='red')
+        show(plot)  # display the plot
+    
+    def plot_ideal_data(self):
+        # Plot the ideal data and the result data using Bokeh.
+        # If the ideal_data or result_data attribute is None, print an error message and return.
+        if self.result_data is None or self.ideal_data is None:
+            print("Error: ideal_data or result_data not found.")
+            return
+        output_notebook()  # initialize Bokeh for Jupyter Notebook
+        source = ColumnDataSource(self.result_data)  # create a data source for the plot
+        # create a scatter plot of x versus y, with hover tool showing chosen function and deviation
+        hover = HoverTool(tooltips=[('x', '@x'), ('y', '@y'), ('chosen_function', '@chosen_function'), ('deviation', '@deviation')])
+        plot = figure(title="Results", x_axis_label="x", y_axis_label="y", tools=[hover])
+        plot.circle(x='x', y='y', source=source, size=10, color='blue')
+        # create a line plot for each y column in the ideal data using different colors for y1, y2, y3, and y4-y50
+        colors = ['red', 'green', 'orange'] + ['black'] * 47
+        for i in range(50):
+            if i == 0:
+                y_col = 'y1'
+            else:
+                y_col = f'y{i+1}'
+            plot.line(x=self.ideal_data['x'], y=self.ideal_data[y_col], line_width=3, color=colors[i])
+        show(plot)  # display the plot
+        
+    def plot_results(self):
+        # Check if the result_data attribute has been set, if not, print an error message and return
+        if self.result_data is None:
+            print("Error: result_data not found.")
+            return
+        # Output the plot in the Jupyter notebook
+        output_notebook()
+        # Create a ColumnDataSource object from the result_data attribute
+        source = ColumnDataSource(self.result_data)
+        # Create a HoverTool object with tooltips for x, y, chosen function and deviation
+        hover = HoverTool(tooltips=[('x', '@x'), ('y', '@y'), ('chosen_function', '@chosen_function'), ('deviation', '@deviation')])
+        # Create a figure object with a title, x and y axis labels, and add the HoverTool object to the tools parameter
+        plot = figure(title="Results", x_axis_label="x", y_axis_label="y", tools=[hover])
+        # Add circles to the plot, with x and y coordinates taken from the ColumnDataSource object
+        plot.circle(x='x', y='y', source=source, size=10, color='blue')
+        # Show the plot
+        show(plot)
+        
+
+class TestIdealFunctionMapper(unittest.TestCase):
+    def test_get_4_functions(self):
+        func_mapper = IdealFunctionMapper("train.csv","ideal.csv","test.csv")
+        # Get the best fit functions from the loaded data
+        ideal_func_results = func_mapper.get_best_fit_functions(func_mapper.train_data)
+        # Check if exactly 4 functions are returned
+        self.assertEqual(len(ideal_func_results), 4)
+
+    def test_map_to_ideal_functions(self):
+        train_file = "train.csv"
+        ideal_file = "ideal.csv"
+        test_file = "test.csv"
+        # create instance of IdealFunctionMapper class
+        mapper = IdealFunctionMapper(train_file, ideal_file, test_file)
+
+        # obtain the best-fit functions for each y-column in the training data
+        best_fit_functions = mapper.get_best_fit_functions(mapper.train_data)
+
+        # map the test data to the closest ideal function for each x-value
+        mappings = mapper.map_to_ideal_functions(best_fit_functions)
+
+        # check that all mappings are valid by ensuring that the chosen function is one of the y-columns in the ideal data
+        for mapping in mappings:
+            x, y, chosen_function, min_deviation = mapping
+            self.assertIn(chosen_function, mapper.y_cols)
+
+    def test_mapping(self):
+        # initialize paths to data files
+        train_file = "train.csv"
+        ideal_file = "ideal.csv"
+        test_file = "test.csv"
+
+        # create instance of IdealFunctionMapper class
+        mapper = IdealFunctionMapper(train_file, ideal_file, test_file)
+
+        # map the test data to the closest ideal function for each x-value
+        results = mapper.map()
+
+        # compare the mapped y-values to the expected y-values obtained by evaluating the corresponding ideal function with the mapped x-value
+        for x, y, func, deviation in results:
+            coefficients = mapper.get_best_fit_functions(mapper.train_data)[func]["coefficients"]
+            expected_y = np.polyval(coefficients, x)
+            expected_deviation = abs(expected_y - y)
+            self.assertEqual(deviation, expected_deviation)
+    
+        
+if __name__ == "__main__":
+    mapper = IdealFunctionMapper("train.csv", "ideal.csv", "test.csv")
+    results = mapper.map()
+    df = pd.DataFrame(
+        results, columns=["x", "y", "chosen_function", "deviation"]
+    )
+    df.to_csv("results.csv", index=False)
+    table = SQLTable("my_db")
+    table.load_train_data("train.csv")
+    table.load_ideal_data("ideal.csv")
+    table.load_results("results.csv")
+    table.visualize_tables()
+    visualizer = Visualization("train.csv", "ideal.csv", "results.csv")
+    visualizer.plot_train_data()
+    visualizer.plot_ideal_data()
+    visualizer.plot_results()
+    unittest.main(argv=['first-arg-is-ignored'], exit=False)
